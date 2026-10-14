@@ -1,4 +1,6 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 
 use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -138,11 +140,78 @@ impl WindowSizeRef {
     }
 }
 
+/// Receive-side flow control shared by a channel's reader and the client session loop.
+///
+/// The loop queues incoming data without awaiting the reader (the queue is bounded in bytes by
+/// the window we granted), and sends `SSH_MSG_CHANNEL_WINDOW_ADJUST` only for bytes the reader
+/// has taken, so one unread channel closes only its own window.
+#[derive(Debug)]
+pub(crate) struct ChannelFlow {
+    /// Bytes taken by the reader and not yet credited to the peer.
+    consumed: AtomicUsize,
+    /// Wake the session loop when `consumed` reaches this (half the window).
+    threshold: usize,
+    /// Bound on queued non-data messages (`channel_buffer_size`); data is bounded by the window.
+    soft_cap: usize,
+    /// One per client session.
+    wake: Arc<Notify>,
+}
+
+impl ChannelFlow {
+    pub(crate) fn new(window_size: u32, soft_cap: usize, wake: Arc<Notify>) -> Arc<Self> {
+        Arc::new(Self {
+            consumed: AtomicUsize::new(0),
+            threshold: (window_size as usize / 2).max(1),
+            soft_cap,
+            wake,
+        })
+    }
+
+    /// Queue capacity: every data message carries at least one byte of window.
+    pub(crate) fn capacity(&self) -> usize {
+        self.soft_cap
+            .saturating_add(self.threshold.saturating_mul(2))
+            .min(usize::MAX >> 4)
+    }
+
+    fn on_recv(&self, msg: &ChannelMsg) {
+        let n = match msg {
+            ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. } => data.len(),
+            _ => return,
+        };
+        let prev = self.consumed.fetch_add(n, Ordering::AcqRel);
+        if prev < self.threshold && prev + n >= self.threshold {
+            self.wake.notify_one();
+        }
+    }
+
+    /// Session side: the bytes to credit now (all consumed bytes once the threshold is reached,
+    /// or unconditionally with `force`), resetting the count.
+    pub(crate) fn take_credit(&self, force: bool) -> usize {
+        if force || self.consumed.load(Ordering::Acquire) >= self.threshold {
+            self.consumed.swap(0, Ordering::AcqRel)
+        } else {
+            0
+        }
+    }
+}
+
 /// A handle to the reading part of a session channel.
 ///
 /// Allows you to read from a channel without borrowing the session
 pub struct ChannelReadHalf {
     pub(crate) receiver: Receiver<ChannelMsg>,
+    pub(crate) flow: Option<Arc<ChannelFlow>>,
+}
+
+impl Drop for ChannelReadHalf {
+    fn drop(&mut self) {
+        if let Some(flow) = &self.flow {
+            // Let the loop see the closed receiver and reopen the window, as before.
+            self.receiver.close();
+            flow.wake.notify_one();
+        }
+    }
 }
 
 impl std::fmt::Debug for ChannelReadHalf {
@@ -154,7 +223,19 @@ impl std::fmt::Debug for ChannelReadHalf {
 impl ChannelReadHalf {
     /// Awaits an incoming [`ChannelMsg`], this method returns [`None`] if the channel has been closed.
     pub async fn wait(&mut self) -> Option<ChannelMsg> {
-        self.receiver.recv().await
+        let msg = self.receiver.recv().await;
+        if let (Some(flow), Some(msg)) = (&self.flow, &msg) {
+            flow.on_recv(msg);
+        }
+        msg
+    }
+
+    pub(crate) fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<ChannelMsg>> {
+        let msg = self.receiver.poll_recv(cx);
+        if let (Some(flow), Poll::Ready(Some(msg))) = (&self.flow, &msg) {
+            flow.on_recv(msg);
+        }
+        msg
     }
 
     /// Make a reader for the [`Channel`] to receive [`ChannelMsg::Data`]
@@ -465,10 +546,15 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> Channel<S> {
         max_packet_size: u32,
         window_size: u32,
         channel_buffer_size: usize,
+        flow: Option<Arc<ChannelFlow>>,
     ) -> (Self, ChannelRef) {
-        let (tx, rx) = tokio::sync::mpsc::channel(channel_buffer_size);
+        let capacity = flow.as_ref().map_or(channel_buffer_size, |f| f.capacity());
+        let (tx, rx) = tokio::sync::mpsc::channel(capacity);
         let window_size = WindowSizeRef::new(window_size);
-        let read_half = ChannelReadHalf { receiver: rx };
+        let read_half = ChannelReadHalf {
+            receiver: rx,
+            flow: flow.clone(),
+        };
         let write_half = ChannelWriteHalf {
             id,
             sender,
@@ -484,6 +570,7 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> Channel<S> {
             ChannelRef {
                 sender: tx,
                 window_size,
+                flow,
             },
         )
     }
@@ -829,7 +916,7 @@ mod tests {
     async fn channel_data_bytes_forwards_to_write_half() {
         let (sender, mut receiver) = mpsc::channel(8);
         let (channel, _reference) =
-            Channel::<(ChannelId, ChannelMsg)>::new(ChannelId(9), sender, 1024, 1024, 8);
+            Channel::<(ChannelId, ChannelMsg)>::new(ChannelId(9), sender, 1024, 1024, 8, None);
 
         channel.data_bytes(Bytes::from_static(b"channel")).await.unwrap();
 

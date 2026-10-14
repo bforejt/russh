@@ -508,6 +508,117 @@ mod channels {
         .await;
     }
 
+    /// Server for the flow-control tests: every session channel gets `FLOOD` bytes, written through
+    /// the window-gated channel writer; the number of bytes written is reported when done.
+    struct FloodServer(tokio::sync::mpsc::UnboundedSender<usize>);
+
+    const FLOOD: usize = 8 * 1024 * 1024;
+
+    impl server::Handler for FloodServer {
+        type Error = crate::Error;
+
+        async fn auth_publickey(
+            &mut self,
+            _: &str,
+            _: &crate::keys::ssh_key::PublicKey,
+        ) -> Result<server::Auth, Self::Error> {
+            Ok(server::Auth::Accept)
+        }
+
+        async fn channel_open_session(
+            &mut self,
+            channel: Channel<server::Msg>,
+            reply: server::ChannelOpenHandle,
+            _session: &mut Session,
+        ) -> Result<(), Self::Error> {
+            reply.accept().await;
+            let done = self.0.clone();
+            let (_read, write) = channel.split();
+            tokio::spawn(async move {
+                let mut sent = 0;
+                while sent < FLOOD {
+                    if write.data_bytes(vec![b'x'; 32 * 1024]).await.is_err() {
+                        break;
+                    }
+                    sent += 32 * 1024;
+                }
+                let _ = done.send(sent);
+                let _ = write.eof().await;
+            });
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct FloodClient {}
+
+    impl client::Handler for FloodClient {
+        type Error = crate::Error;
+
+        async fn check_server_key(
+            &mut self,
+            _server_public_key: &PublicKeyOrCertificate,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+    }
+
+    async fn read_data(ch: &mut Channel<client::Msg>, n: usize) -> usize {
+        let mut got = 0;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while got < n {
+                match ch.wait().await {
+                    Some(ChannelMsg::Data { data }) => got += data.len(),
+                    Some(_) => {}
+                    None => break,
+                }
+            }
+        })
+        .await;
+        got
+    }
+
+    /// An unread channel must not stall its siblings: its window closes, the session loop keeps
+    /// running, and once the reader resumes it receives everything.
+    #[tokio::test]
+    async fn test_unread_channel_does_not_block_sibling() {
+        let (done, _done_rx) = tokio::sync::mpsc::unbounded_channel();
+        test_session(
+            FloodClient {},
+            FloodServer(done),
+            |c| async move {
+                let mut unread = c.channel_open_session().await.unwrap();
+                let mut read = c.channel_open_session().await.unwrap();
+                assert_eq!(read_data(&mut read, FLOOD).await, FLOOD);
+                assert_eq!(read_data(&mut unread, FLOOD).await, FLOOD);
+                c
+            },
+            |s| async move { s },
+        )
+        .await;
+    }
+
+    /// Dropping a channel's reader reopens its window, so the peer can finish writing.
+    #[tokio::test]
+    async fn test_dropped_reader_reopens_window() {
+        let (done, mut done_rx) = tokio::sync::mpsc::unbounded_channel();
+        test_session(
+            FloodClient {},
+            FloodServer(done),
+            |c| async move {
+                let ch = c.channel_open_session().await.unwrap();
+                drop(ch);
+                let sent = tokio::time::timeout(std::time::Duration::from_secs(10), done_rx.recv())
+                    .await
+                    .unwrap();
+                assert_eq!(sent, Some(FLOOD));
+                c
+            },
+            |s| async move { s },
+        )
+        .await;
+    }
+
     /// Verify that the server-side CHANNEL_CLOSE handler delivers
     /// `ChannelMsg::Close` before the channel stream ends.
     #[tokio::test]

@@ -1897,6 +1897,7 @@ impl Session {
             channel_params.recipient_maximum_packet_size,
             channel_params.recipient_window_size,
             self.common.config.channel_buffer_size,
+            None,
         );
 
         let pending = PendingChannelOpen {
