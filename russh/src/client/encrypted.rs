@@ -761,9 +761,14 @@ impl Session {
                     )? as u32;
                 }
                 if let Some(chan) = self.channels.get(&channel_num) {
-                    chan.window_size().update(new_size).await;
-                    // WindowAdjusted is informational - the critical side effect (updating
-                    // WindowSizeRef and notifying ChannelTx) already happens in update().
+                    // Credit the amount; never overwrite the writers' window with the loop's
+                    // count, which does not include the `Data` messages a writer has already
+                    // reserved but the loop has not processed yet (those would be counted
+                    // twice, overshoot the peer's window, land in `pending_data` and close the
+                    // session-wide outbound gate behind a peer that stops adjusting).
+                    chan.window_size().credit(amount).await;
+                    // WindowAdjusted is informational - the critical side effect (crediting
+                    // WindowSizeRef and notifying ChannelTx) already happens in credit().
                     chan.deliver_info(ChannelMsg::WindowAdjusted { new_size });
                 }
                 client.window_adjusted(channel_num, new_size, self).await

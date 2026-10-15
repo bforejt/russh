@@ -135,6 +135,20 @@ impl WindowSizeRef {
         self.notifier.notify_one();
     }
 
+    /// Credit `amount` bytes of window to the channel's writers.
+    ///
+    /// `CHANNEL_WINDOW_ADJUST` adds to this value instead of overwriting it with the session
+    /// loop's own count: the writers (`ChannelTx`, `send_bytes`) reserve bytes here before the
+    /// loop sees the `Data` messages, so the loop's count does not yet include what is in
+    /// flight between a writer and the loop, and overwriting it let a writer reserve those bytes
+    /// twice. The excess then landed in the channel's `pending_data` and, behind a peer that
+    /// never adjusted again, closed the session-wide outbound gate for every channel.
+    pub(crate) async fn credit(&self, amount: u32) {
+        let mut value = self.value.lock().await;
+        *value = value.saturating_add(amount);
+        self.notifier.notify_one();
+    }
+
     pub(crate) fn subscribe(&self) -> Arc<Notify> {
         Arc::clone(&self.notifier)
     }
