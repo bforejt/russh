@@ -2038,7 +2038,27 @@ async fn reply<H: Handler>(
                         .await?;
 
                     if session.common.encrypted.is_some() {
-                        // This is a rekey
+                        // This is a rekey. The server signed this exchange with a host
+                        // key too, and it is checked exactly as the initial one was: a
+                        // peer that presents another key mid-session is a man in the
+                        // middle or a re-keyed host, and only the handler can tell. Before
+                        // this check only the initial key exchange asked the handler, so a
+                        // rekey could install keys exchanged under an unverified host key.
+                        if let Some(certificate) = server_host_certificate {
+                            if !handler.check_server_key(&certificate.into()).await? {
+                                return Err(crate::Error::UnknownKey.into());
+                            }
+                        } else if let Some(server_host_key) = server_host_key {
+                            let check = handler.check_server_key(&server_host_key.into()).await?;
+                            if !check {
+                                return Err(crate::Error::UnknownKey.into());
+                            }
+                        } else {
+                            // A completed exchange always carries the server's key (the
+                            // client kex sets it on DH_REPLY); nothing to verify is a
+                            // protocol error, not a pass.
+                            return Err(crate::Error::UnknownKey.into());
+                        }
                         {
                             let common = &mut session.common;
                             common.newkeys(newkeys);
