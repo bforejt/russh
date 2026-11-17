@@ -335,6 +335,54 @@ impl Encrypted {
         Ok(false)
     }
 
+    /// Account for incoming data on a channel whose window is credited on consumption
+    /// ([`Self::credit_window`]). Returns `false` if the peer exceeded the window.
+    pub(crate) fn consume_window(&mut self, channel: ChannelId, len: usize) -> bool {
+        let Some(channel) = self.channels.get_mut(&channel) else {
+            return true;
+        };
+        match u32::try_from(len) {
+            Ok(len) if len <= channel.sender_window_size => {
+                channel.sender_window_size -= len;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Send `SSH_MSG_CHANNEL_WINDOW_ADJUST` for `consumed` bytes. If the reader is gone, top the
+    /// window up to `target` instead (the on-arrival behaviour). Returns whether one was sent.
+    pub(crate) fn credit_window(
+        &mut self,
+        channel: ChannelId,
+        consumed: usize,
+        target: u32,
+        reader_gone: bool,
+    ) -> Result<bool, crate::Error> {
+        let Some(channel) = self.channels.get_mut(&channel) else {
+            return Ok(false);
+        };
+        let bytes = if reader_gone {
+            if channel.sender_window_size >= target / 2 {
+                return Ok(false);
+            }
+            target - channel.sender_window_size
+        } else {
+            u32::try_from(consumed).unwrap_or(u32::MAX)
+        }
+        .min(u32::MAX - channel.sender_window_size);
+        if bytes == 0 {
+            return Ok(false);
+        }
+        push_packet!(self.write, {
+            self.write.push(msg::CHANNEL_WINDOW_ADJUST);
+            channel.recipient_channel.encode(&mut self.write)?;
+            bytes.encode(&mut self.write)?;
+        });
+        channel.sender_window_size += bytes;
+        Ok(true)
+    }
+
     fn flush_channel(
         write: &mut Vec<u8>,
         channel: &mut ChannelParams,

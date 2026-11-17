@@ -433,6 +433,40 @@ impl Session {
         }
     }
 
+    /// Window accounting for incoming channel data; `false` means discard it. Channels with flow
+    /// control are credited when their reader consumes the data ([`Session::credit_consumed`]).
+    fn account_incoming<H: Handler>(
+        &mut self,
+        client: &mut H,
+        channel_num: ChannelId,
+        data: &[u8],
+    ) -> Result<bool, Error> {
+        let target = self.common.config.window_size;
+        let on_consumption = self
+            .channels
+            .get(&channel_num)
+            .is_some_and(|c| c.credits_on_consumption());
+        if let Some(ref mut enc) = self.common.encrypted {
+            if on_consumption {
+                if !enc.consume_window(channel_num, data.len()) {
+                    warn!(
+                        "{channel_num:?}: peer exceeded the window, discarding {} bytes",
+                        data.len()
+                    );
+                    return Ok(false);
+                }
+                return Ok(!data.is_empty());
+            }
+            if enc.adjust_window_size(channel_num, data, target)? {
+                let next_window = client.adjust_window(channel_num, self.target_window_size);
+                if next_window > 0 {
+                    self.target_window_size = next_window
+                }
+            }
+        }
+        Ok(true)
+    }
+
     fn handle_ext_info(&mut self, r: &mut impl Reader) -> Result<(), Error> {
         // RFC 8308 §2.4: a server sends EXT_INFO at most twice per session.
         // Refusing more keeps `received_extensions` bounded.
@@ -502,13 +536,12 @@ impl Session {
 
                 if let Some(channel) = self.channels.get(&local_id) {
                     channel
-                        .send(ChannelMsg::Open {
+                        .deliver(ChannelMsg::Open {
                             id: local_id,
                             max_packet_size: msg.maximum_packet_size,
                             window_size: msg.initial_window_size,
                         })
-                        .await
-                        .unwrap_or(());
+                        .await;
                 } else {
                     error!("no channel for id {local_id:?}");
                 }
@@ -538,7 +571,7 @@ impl Session {
                 // consumers waiting on `Channel::wait()` receive an explicit
                 // `ChannelMsg::Close` instead of just seeing `None`.
                 if let Some(chan) = self.channels.get(&channel_num) {
-                    let _ = chan.send(ChannelMsg::Close).await;
+                    chan.deliver(ChannelMsg::Close).await;
                 }
                 self.channels.remove(&channel_num);
                 client.channel_close(channel_num, self).await
@@ -551,7 +584,7 @@ impl Session {
                     return Ok(());
                 }
                 if let Some(chan) = self.channels.get(&channel_num) {
-                    let _ = chan.send(ChannelMsg::Eof).await;
+                    chan.deliver(ChannelMsg::Eof).await;
                 }
                 client.channel_eof(channel_num, self).await
             }
@@ -576,8 +609,8 @@ impl Session {
                 }
 
                 if let Some(sender) = self.channels.remove(&channel_num) {
-                    let _ = sender
-                        .send(ChannelMsg::OpenFailure(reason_code.clone()))
+                    sender
+                        .deliver(ChannelMsg::OpenFailure(reason_code.clone()))
                         .await;
                 }
 
@@ -595,20 +628,12 @@ impl Session {
                 if !self.common.is_established_channel(channel_num) {
                     return Ok(());
                 }
-                let target = self.common.config.window_size;
-                #[allow(clippy::collapsible_if)]
-                if let Some(ref mut enc) = self.common.encrypted {
-                    if enc.adjust_window_size(channel_num, &data, target)? {
-                        let next_window =
-                            client.adjust_window(channel_num, self.target_window_size);
-                        if next_window > 0 {
-                            self.target_window_size = next_window
-                        }
-                    }
+                if !self.account_incoming(client, channel_num, &data)? {
+                    return Ok(());
                 }
 
                 if let Some(chan) = self.channels.get(&channel_num) {
-                    let _ = chan.send(ChannelMsg::Data { data: data.clone() }).await;
+                    chan.deliver(ChannelMsg::Data { data: data.clone() }).await;
                 }
 
                 client.data(channel_num, &data, self).await
@@ -622,25 +647,16 @@ impl Session {
                 if !self.common.is_established_channel(channel_num) {
                     return Ok(());
                 }
-                let target = self.common.config.window_size;
-                #[allow(clippy::collapsible_if)]
-                if let Some(ref mut enc) = self.common.encrypted {
-                    if enc.adjust_window_size(channel_num, &data, target)? {
-                        let next_window =
-                            client.adjust_window(channel_num, self.target_window_size);
-                        if next_window > 0 {
-                            self.target_window_size = next_window
-                        }
-                    }
+                if !self.account_incoming(client, channel_num, &data)? {
+                    return Ok(());
                 }
 
                 if let Some(chan) = self.channels.get(&channel_num) {
-                    let _ = chan
-                        .send(ChannelMsg::ExtendedData {
-                            ext: extended_code,
-                            data: data.clone(),
-                        })
-                        .await;
+                    chan.deliver(ChannelMsg::ExtendedData {
+                        ext: extended_code,
+                        data: data.clone(),
+                    })
+                    .await;
                 }
 
                 client
@@ -660,7 +676,7 @@ impl Session {
                         let client_can_do = map_err!(u8::decode(&mut r))? != 0;
                         map_err!(ensure_end(&r))?;
                         if let Some(chan) = self.channels.get(&channel_num) {
-                            let _ = chan.send(ChannelMsg::XonXoff { client_can_do }).await;
+                            chan.deliver(ChannelMsg::XonXoff { client_can_do }).await;
                         }
                         client.xon_xoff(channel_num, client_can_do, self).await
                     }
@@ -669,7 +685,7 @@ impl Session {
                         let exit_status = map_err!(u32::decode(&mut r))?;
                         map_err!(ensure_end(&r))?;
                         if let Some(chan) = self.channels.get(&channel_num) {
-                            let _ = chan.send(ChannelMsg::ExitStatus { exit_status }).await;
+                            chan.deliver(ChannelMsg::ExitStatus { exit_status }).await;
                         }
                         client.exit_status(channel_num, exit_status, self).await
                     }
@@ -682,14 +698,13 @@ impl Session {
                         let lang_tag = map_err!(String::decode(&mut r))?;
                         map_err!(ensure_end(&r))?;
                         if let Some(chan) = self.channels.get(&channel_num) {
-                            let _ = chan
-                                .send(ChannelMsg::ExitSignal {
-                                    signal_name: signal_name.clone(),
-                                    core_dumped,
-                                    error_message: error_message.to_string(),
-                                    lang_tag: lang_tag.to_string(),
-                                })
-                                .await;
+                            chan.deliver(ChannelMsg::ExitSignal {
+                                signal_name: signal_name.clone(),
+                                core_dumped,
+                                error_message: error_message.to_string(),
+                                lang_tag: lang_tag.to_string(),
+                            })
+                            .await;
                         }
                         client
                             .exit_signal(
@@ -768,10 +783,9 @@ impl Session {
                 }
                 if let Some(chan) = self.channels.get(&channel_num) {
                     chan.window_size().grow(amount).await;
-                    // Use try_send to avoid blocking the session loop when channel buffer is full.
                     // WindowAdjusted is informational - the critical side effect (updating
                     // WindowSizeRef and notifying ChannelTx) already happens in grow().
-                    let _ = chan.try_send(ChannelMsg::WindowAdjusted { new_size });
+                    chan.deliver_info(ChannelMsg::WindowAdjusted { new_size });
                 }
                 client.window_adjusted(channel_num, new_size, self).await
             }
@@ -819,7 +833,7 @@ impl Session {
                     return Ok(());
                 }
                 if let Some(chan) = self.channels.get(&channel_num) {
-                    let _ = chan.send(ChannelMsg::Success).await;
+                    chan.deliver(ChannelMsg::Success).await;
                 }
                 client.channel_success(channel_num, self).await
             }
@@ -830,7 +844,7 @@ impl Session {
                     return Ok(());
                 }
                 if let Some(chan) = self.channels.get(&channel_num) {
-                    let _ = chan.send(ChannelMsg::Failure).await;
+                    chan.deliver(ChannelMsg::Failure).await;
                 }
                 client.channel_failure(channel_num, self).await
             }
@@ -863,6 +877,7 @@ impl Session {
                     channel_params.recipient_maximum_packet_size,
                     channel_params.recipient_window_size,
                     self.common.config.channel_buffer_size,
+                    Some(self.new_channel_flow()),
                 );
 
                 let pending = crate::PendingChannelOpen {

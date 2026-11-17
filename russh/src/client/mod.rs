@@ -54,12 +54,12 @@ use tokio::pin;
 use tokio::sync::mpsc::{
     Receiver, Sender, UnboundedReceiver, UnboundedSender, channel, unbounded_channel,
 };
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, oneshot};
 
 pub use crate::auth::AuthResult;
 use crate::cert::PublicKeyOrCertificate;
 use crate::channels::{
-    Channel, ChannelMsg, ChannelReadHalf, ChannelRef, ChannelWriteHalf, WindowSizeRef,
+    Channel, ChannelFlow, ChannelMsg, ChannelReadHalf, ChannelRef, ChannelWriteHalf, WindowSizeRef,
 };
 use crate::cipher::{self, OpeningKey, clear};
 use crate::kex::{KexAlgorithmImplementor, KexCause, KexProgress, SessionKexState};
@@ -103,6 +103,8 @@ pub struct Session {
     server_sig_algs: Option<Vec<Algorithm>>,
     /// Number of EXT_INFO messages received (RFC 8308 allows at most two).
     ext_info_count: u8,
+    /// Woken by channel readers when consumed bytes can be credited.
+    flow_wake: Arc<Notify>,
 }
 
 impl Drop for Session {
@@ -319,6 +321,8 @@ pub struct Handle<H: Handler> {
     join: russh_util::runtime::JoinHandle<Result<(), H::Error>>,
     channel_buffer_size: usize,
     agent_session_binding: Option<crate::keys::agent::AgentSessionBinding>,
+    window_size: u32,
+    flow_wake: Arc<Notify>,
 }
 
 impl<H: Handler> Drop for Handle<H> {
@@ -738,10 +742,22 @@ impl<H: Handler> Handle<H> {
     }
 
     /// Wait for confirmation that a channel is open
+    /// A channel whose window is credited when its reader consumes data.
+    fn new_flow_channel(&self) -> (ChannelRef, Receiver<ChannelMsg>, Arc<ChannelFlow>) {
+        let flow = ChannelFlow::new(
+            self.window_size,
+            self.channel_buffer_size,
+            self.flow_wake.clone(),
+        );
+        let (sender, receiver) = channel(flow.capacity());
+        (ChannelRef::with_flow(sender, flow.clone()), receiver, flow)
+    }
+
     async fn wait_channel_confirmation(
         &self,
         mut receiver: Receiver<ChannelMsg>,
         window_size_ref: WindowSizeRef,
+        flow: Arc<ChannelFlow>,
     ) -> Result<Channel<Msg>, crate::Error> {
         loop {
             match receiver.recv().await {
@@ -759,7 +775,10 @@ impl<H: Handler> Handle<H> {
                             max_packet_size,
                             window_size: window_size_ref,
                         },
-                        read_half: ChannelReadHalf { receiver },
+                        read_half: ChannelReadHalf {
+                            receiver,
+                            flow: Some(flow),
+                        },
                     });
                 }
                 Some(ChannelMsg::OpenFailure(reason)) => {
@@ -842,15 +861,14 @@ impl<H: Handler> Handle<H> {
     /// usable when it's confirmed by the server, as indicated by the
     /// `confirmed` field of the corresponding `Channel`.
     pub async fn channel_open_session(&self) -> Result<Channel<Msg>, crate::Error> {
-        let (sender, receiver) = channel(self.channel_buffer_size);
-        let channel_ref = ChannelRef::new(sender);
+        let (channel_ref, receiver, flow) = self.new_flow_channel();
         let window_size_ref = channel_ref.window_size().clone();
 
         self.sender
             .send(Msg::ChannelOpenSession { channel_ref })
             .await
             .map_err(|_| crate::Error::SendError)?;
-        self.wait_channel_confirmation(receiver, window_size_ref)
+        self.wait_channel_confirmation(receiver, window_size_ref, flow)
             .await
     }
 
@@ -860,8 +878,7 @@ impl<H: Handler> Handle<H> {
         originator_address: A,
         originator_port: u32,
     ) -> Result<Channel<Msg>, crate::Error> {
-        let (sender, receiver) = channel(self.channel_buffer_size);
-        let channel_ref = ChannelRef::new(sender);
+        let (channel_ref, receiver, flow) = self.new_flow_channel();
         let window_size_ref = channel_ref.window_size().clone();
 
         self.sender
@@ -872,7 +889,7 @@ impl<H: Handler> Handle<H> {
             })
             .await
             .map_err(|_| crate::Error::SendError)?;
-        self.wait_channel_confirmation(receiver, window_size_ref)
+        self.wait_channel_confirmation(receiver, window_size_ref, flow)
             .await
     }
 
@@ -891,8 +908,7 @@ impl<H: Handler> Handle<H> {
         originator_address: B,
         originator_port: u32,
     ) -> Result<Channel<Msg>, crate::Error> {
-        let (sender, receiver) = channel(self.channel_buffer_size);
-        let channel_ref = ChannelRef::new(sender);
+        let (channel_ref, receiver, flow) = self.new_flow_channel();
         let window_size_ref = channel_ref.window_size().clone();
 
         self.sender
@@ -905,7 +921,7 @@ impl<H: Handler> Handle<H> {
             })
             .await
             .map_err(|_| crate::Error::SendError)?;
-        self.wait_channel_confirmation(receiver, window_size_ref)
+        self.wait_channel_confirmation(receiver, window_size_ref, flow)
             .await
     }
 
@@ -913,8 +929,7 @@ impl<H: Handler> Handle<H> {
         &self,
         socket_path: S,
     ) -> Result<Channel<Msg>, crate::Error> {
-        let (sender, receiver) = channel(self.channel_buffer_size);
-        let channel_ref = ChannelRef::new(sender);
+        let (channel_ref, receiver, flow) = self.new_flow_channel();
         let window_size_ref = channel_ref.window_size().clone();
 
         self.sender
@@ -924,7 +939,7 @@ impl<H: Handler> Handle<H> {
             })
             .await
             .map_err(|_| crate::Error::SendError)?;
-        self.wait_channel_confirmation(receiver, window_size_ref)
+        self.wait_channel_confirmation(receiver, window_size_ref, flow)
             .await
     }
 
@@ -1235,6 +1250,7 @@ where
         );
     }
     let channel_buffer_size = config.channel_buffer_size;
+    let window_size = config.window_size;
     let mut session = Session::new(
         config.window_size,
         CommonSession {
@@ -1257,6 +1273,7 @@ where
         session_sender,
     );
     session.begin_rekey()?;
+    let flow_wake = session.flow_wake.clone();
     let (kex_done_signal, kex_done_signal_rx) = oneshot::channel();
     let join = russh_util::runtime::spawn(session.run(stream, handler, Some(kex_done_signal)));
 
@@ -1277,6 +1294,8 @@ where
         join,
         channel_buffer_size,
         agent_session_binding,
+        window_size,
+        flow_wake,
     })
 }
 
@@ -1335,7 +1354,38 @@ impl Session {
             open_global_requests: VecDeque::new(),
             server_sig_algs: None,
             ext_info_count: 0,
+            flow_wake: Arc::new(Notify::new()),
         }
+    }
+
+    pub(crate) fn new_channel_flow(&self) -> Arc<ChannelFlow> {
+        ChannelFlow::new(
+            self.common.config.window_size,
+            self.common.config.channel_buffer_size,
+            self.flow_wake.clone(),
+        )
+    }
+
+    /// Send `WINDOW_ADJUST` for data that channel readers have consumed (or whose reader is gone).
+    fn credit_consumed<H: Handler>(&mut self, handler: &mut H) -> Result<(), Error> {
+        let target = self.common.config.window_size;
+        let Some(enc) = self.common.encrypted.as_mut() else {
+            return Ok(());
+        };
+        for (id, chan) in &self.channels {
+            let Some(flow) = chan.flow() else { continue };
+            let reader_gone = chan.is_closed();
+            let consumed = flow.take_credit(reader_gone);
+            if (consumed > 0 || reader_gone)
+                && enc.credit_window(*id, consumed, target, reader_gone)?
+            {
+                let next_window = handler.adjust_window(*id, self.target_window_size);
+                if next_window > 0 {
+                    self.target_window_size = next_window
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn run<H: Handler + Send, R: AsyncRead + AsyncWrite + Unpin + Send>(
@@ -1416,6 +1466,7 @@ impl Session {
 
         let reading = start_reading(stream_read, buffer, opening_cipher);
         pin!(reading);
+        let flow_wake = self.flow_wake.clone();
 
         #[allow(clippy::panic)] // false positive in select! macro
         while !self.common.disconnected {
@@ -1492,6 +1543,9 @@ impl Session {
                 () = &mut inactivity_timer => {
                     debug!("timeout");
                     return Err(crate::Error::InactivityTimeout.into());
+                }
+                () = flow_wake.notified() => {
+                    self.credit_consumed(handler)?;
                 }
                 msg = self.receiver.recv(), if can_receive_outbound => {
                     self.drain_priority_msgs()?;
